@@ -152,6 +152,7 @@ func Run(opt *options.ServerOption) error {
 			mpiJobClientSet,
 			kubeBatchClientSet,
 			kubeInformerFactory.Core().V1().ConfigMaps(),
+			kubeInformerFactory.Core().V1().Services(),
 			kubeInformerFactory.Core().V1().ServiceAccounts(),
 			kubeInformerFactory.Rbac().V1().Roles(),
 			kubeInformerFactory.Rbac().V1().RoleBindings(),

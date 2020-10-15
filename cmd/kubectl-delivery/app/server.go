@@ -107,11 +107,11 @@ func Run(opt *options.ServerOption) error {
 			}
 			continue
 		}
-		lines := strings.SplitN(string(line), " ", 2)
+		lines := strings.SplitN(string(line), ".", 2)
 		// When using Intel MPI or MPICH, the hostfile format is hostname:slots, so need spliting the line by colon.
-		if strings.Contains(lines[0], ":") {
-			lines = strings.SplitN(string(line), ":", 2)
-		}
+		//if strings.Contains(lines[0], ":") {
+		//	lines = strings.SplitN(string(line), ":", 2)
+		//}
 		if !strings.HasSuffix(lines[0], launcherPodSuffix) {
 			pods = append(pods, lines[0])
 		}

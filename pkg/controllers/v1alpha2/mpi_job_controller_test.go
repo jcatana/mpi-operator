@@ -60,6 +60,7 @@ type fixture struct {
 
 	// Objects to put in the store.
 	configMapLister      []*corev1.ConfigMap
+	serviceLister        []*corev1.Service
 	serviceAccountLister []*corev1.ServiceAccount
 	roleLister           []*rbacv1.Role
 	roleBindingLister    []*rbacv1.RoleBinding
@@ -168,6 +169,7 @@ func (f *fixture) newController(gangSchedulerName string) (*MPIJobController, in
 		f.client,
 		f.kubebatchClient,
 		k8sI.Core().V1().ConfigMaps(),
+		k8sI.Core().V1().Services(),
 		k8sI.Core().V1().ServiceAccounts(),
 		k8sI.Rbac().V1().Roles(),
 		k8sI.Rbac().V1().RoleBindings(),
@@ -180,6 +182,7 @@ func (f *fixture) newController(gangSchedulerName string) (*MPIJobController, in
 	)
 
 	c.configMapSynced = alwaysReady
+	c.serviceSynced = alwaysReady
 	c.serviceAccountSynced = alwaysReady
 	c.roleSynced = alwaysReady
 	c.roleBindingSynced = alwaysReady
@@ -193,6 +196,13 @@ func (f *fixture) newController(gangSchedulerName string) (*MPIJobController, in
 		err := k8sI.Core().V1().ConfigMaps().Informer().GetIndexer().Add(configMap)
 		if err != nil {
 			fmt.Println("Failed to create config map")
+		}
+	}
+
+	for _, service := range f.serviceLister {
+		err := k8sI.Core().V1().Services().Informer().GetIndexer().Add(service)
+		if err != nil {
+			fmt.Println("Failed to create service")
 		}
 	}
 
@@ -370,6 +380,8 @@ func filterInformerActions(actions []core.Action) []core.Action {
 		if len(action.GetNamespace()) == 0 &&
 			(action.Matches("list", "configmaps") ||
 				action.Matches("watch", "configmaps") ||
+				action.Matches("list", "services") ||
+				action.Matches("watch", "services") ||
 				action.Matches("list", "serviceaccounts") ||
 				action.Matches("watch", "serviceaccounts") ||
 				action.Matches("list", "roles") ||
@@ -426,6 +438,11 @@ func (f *fixture) setUpWorker(worker *appsv1.StatefulSet) {
 func (f *fixture) setUpConfigMap(configMap *corev1.ConfigMap) {
 	f.configMapLister = append(f.configMapLister, configMap)
 	f.kubeObjects = append(f.kubeObjects, configMap)
+}
+
+func (f *fixture) setUpService(service *corev1.Service) {
+	f.serviceLister = append(f.serviceLister, service)
+	f.kubeObjects = append(f.kubeObjects, service)
 }
 
 func (f *fixture) setUpServiceAccount(serviceAccount *corev1.ServiceAccount) {
@@ -492,7 +509,7 @@ func TestDoNothingWithNonexistentMPIJob(t *testing.T) {
 	f := newFixture(t)
 	startTime := metav1.Now()
 	completionTime := metav1.Now()
-	mpiJob := newMPIJob("test", int32Ptr(64), 1, gpuResourceName, &startTime, &completionTime)
+	mpiJob := newMPIJob("experiment", int32Ptr(64), 1, gpuResourceName, &startTime, &completionTime)
 	f.run(getKey(mpiJob, t))
 }
 
@@ -501,7 +518,7 @@ func TestLauncherNotControlledByUs(t *testing.T) {
 	startTime := metav1.Now()
 	completionTime := metav1.Now()
 
-	mpiJob := newMPIJob("test", int32Ptr(64), 1, gpuResourceName, &startTime, &completionTime)
+	mpiJob := newMPIJob("experiment", int32Ptr(64), 1, gpuResourceName, &startTime, &completionTime)
 	f.setUpMPIJob(mpiJob)
 
 	fmjc := newFakeMPIJobController()
@@ -518,7 +535,7 @@ func TestLauncherSucceeded(t *testing.T) {
 	startTime := metav1.Now()
 	completionTime := metav1.Now()
 
-	mpiJob := newMPIJob("test", int32Ptr(64), 1, gpuResourceName, &startTime, &completionTime)
+	mpiJob := newMPIJob("experiment", int32Ptr(64), 1, gpuResourceName, &startTime, &completionTime)
 	f.setUpMPIJob(mpiJob)
 
 	fmjc := newFakeMPIJobController()
@@ -560,7 +577,7 @@ func TestLauncherFailed(t *testing.T) {
 	startTime := metav1.Now()
 	completionTime := metav1.Now()
 
-	mpiJob := newMPIJob("test", int32Ptr(64), 1, gpuResourceName, &startTime, &completionTime)
+	mpiJob := newMPIJob("experiment", int32Ptr(64), 1, gpuResourceName, &startTime, &completionTime)
 	f.setUpMPIJob(mpiJob)
 
 	fmjc := newFakeMPIJobController()
@@ -602,7 +619,7 @@ func TestConfigMapNotControlledByUs(t *testing.T) {
 	startTime := metav1.Now()
 	completionTime := metav1.Now()
 
-	mpiJob := newMPIJob("test", int32Ptr(64), 1, gpuResourceName, &startTime, &completionTime)
+	mpiJob := newMPIJob("experiment", int32Ptr(64), 1, gpuResourceName, &startTime, &completionTime)
 	f.setUpMPIJob(mpiJob)
 
 	configMap := newConfigMap(mpiJob, 8)
@@ -612,18 +629,36 @@ func TestConfigMapNotControlledByUs(t *testing.T) {
 	f.runExpectError(getKey(mpiJob, t))
 }
 
+func TestServiceNotControlledByUs(t *testing.T) {
+	f := newFixture(t)
+	startTime := metav1.Now()
+	completionTime := metav1.Now()
+
+	mpiJob := newMPIJob("experiment", int32Ptr(64), 1, gpuResourceName, &startTime, &completionTime)
+	f.setUpMPIJob(mpiJob)
+
+	f.setUpConfigMap(newConfigMap(mpiJob, 8))
+
+	service := newLauncherService(mpiJob)
+	service.OwnerReferences = nil
+	f.setUpService(service)
+
+	f.runExpectError(getKey(mpiJob, t))
+}
+
 func TestServiceAccountNotControlledByUs(t *testing.T) {
 	f := newFixture(t)
 	startTime := metav1.Now()
 	completionTime := metav1.Now()
 
-	mpiJob := newMPIJob("test", int32Ptr(64), 1, gpuResourceName, &startTime, &completionTime)
+	mpiJob := newMPIJob("experiment", int32Ptr(64), 1, gpuResourceName, &startTime, &completionTime)
 	f.setUpMPIJob(mpiJob)
 
 	f.setUpConfigMap(newConfigMap(mpiJob, 8))
 
 	serviceAccount := newLauncherServiceAccount(mpiJob)
 	serviceAccount.OwnerReferences = nil
+	f.setUpService(newLauncherService(mpiJob))
 	f.setUpServiceAccount(serviceAccount)
 
 	f.runExpectError(getKey(mpiJob, t))
@@ -634,10 +669,11 @@ func TestRoleNotControlledByUs(t *testing.T) {
 	startTime := metav1.Now()
 	completionTime := metav1.Now()
 
-	mpiJob := newMPIJob("test", int32Ptr(64), 1, gpuResourceName, &startTime, &completionTime)
+	mpiJob := newMPIJob("experiment", int32Ptr(64), 1, gpuResourceName, &startTime, &completionTime)
 	f.setUpMPIJob(mpiJob)
 
 	f.setUpConfigMap(newConfigMap(mpiJob, 8))
+	f.setUpService(newLauncherService(mpiJob))
 	f.setUpServiceAccount(newLauncherServiceAccount(mpiJob))
 
 	role := newLauncherRole(mpiJob, 8)
@@ -652,10 +688,11 @@ func TestRoleBindingNotControlledByUs(t *testing.T) {
 	startTime := metav1.Now()
 	completionTime := metav1.Now()
 
-	mpiJob := newMPIJob("test", int32Ptr(64), 1, gpuResourceName, &startTime, &completionTime)
+	mpiJob := newMPIJob("experiment", int32Ptr(64), 1, gpuResourceName, &startTime, &completionTime)
 	f.setUpMPIJob(mpiJob)
 
 	f.setUpConfigMap(newConfigMap(mpiJob, 8))
+	f.setUpService(newLauncherService(mpiJob))
 	f.setUpServiceAccount(newLauncherServiceAccount(mpiJob))
 	f.setUpRole(newLauncherRole(mpiJob, 8))
 
@@ -671,7 +708,7 @@ func TestShutdownWorker(t *testing.T) {
 	startTime := metav1.Now()
 	completionTime := metav1.Now()
 
-	mpiJob := newMPIJob("test", int32Ptr(64), 1, gpuResourceName, &startTime, &completionTime)
+	mpiJob := newMPIJob("experiment", int32Ptr(64), 1, gpuResourceName, &startTime, &completionTime)
 	msg := fmt.Sprintf("MPIJob %s/%s successfully completed.", mpiJob.Namespace, mpiJob.Name)
 	err := updateMPIJobConditions(mpiJob, common.JobSucceeded, mpiJobSucceededReason, msg)
 	if err != nil {
@@ -717,10 +754,11 @@ func TestWorkerNotControlledByUs(t *testing.T) {
 	startTime := metav1.Now()
 	completionTime := metav1.Now()
 
-	mpiJob := newMPIJob("test", int32Ptr(64), 1, gpuResourceName, &startTime, &completionTime)
+	mpiJob := newMPIJob("experiment", int32Ptr(64), 1, gpuResourceName, &startTime, &completionTime)
 	f.setUpMPIJob(mpiJob)
 
 	f.setUpConfigMap(newConfigMap(mpiJob, 8))
+	f.setUpService(newLauncherService(mpiJob))
 	f.setUpRbac(mpiJob, 8)
 
 	worker := newWorker(mpiJob, 8, "")
@@ -735,10 +773,11 @@ func TestLauncherActiveWorkerNotReady(t *testing.T) {
 	startTime := metav1.Now()
 	completionTime := metav1.Now()
 
-	mpiJob := newMPIJob("test", int32Ptr(8), 1, gpuResourceName, &startTime, &completionTime)
+	mpiJob := newMPIJob("experiment", int32Ptr(8), 1, gpuResourceName, &startTime, &completionTime)
 	f.setUpMPIJob(mpiJob)
 
 	f.setUpConfigMap(newConfigMap(mpiJob, 1))
+	f.setUpService(newLauncherService(mpiJob))
 	f.setUpRbac(mpiJob, 1)
 
 	fmjc := newFakeMPIJobController()
@@ -773,10 +812,11 @@ func TestLauncherActiveWorkerReady(t *testing.T) {
 	startTime := metav1.Now()
 	completionTime := metav1.Now()
 
-	mpiJob := newMPIJob("test", int32Ptr(8), 1, gpuResourceName, &startTime, &completionTime)
+	mpiJob := newMPIJob("experiment", int32Ptr(8), 1, gpuResourceName, &startTime, &completionTime)
 	f.setUpMPIJob(mpiJob)
 
 	f.setUpConfigMap(newConfigMap(mpiJob, 1))
+	f.setUpService(newLauncherService(mpiJob))
 	f.setUpRbac(mpiJob, 1)
 
 	fmjc := newFakeMPIJobController()
@@ -816,10 +856,11 @@ func TestLauncherRestarting(t *testing.T) {
 	startTime := metav1.Now()
 	completionTime := metav1.Now()
 
-	mpiJob := newMPIJob("test", int32Ptr(8), 1, gpuResourceName, &startTime, &completionTime)
+	mpiJob := newMPIJob("experiment", int32Ptr(8), 1, gpuResourceName, &startTime, &completionTime)
 	f.setUpMPIJob(mpiJob)
 
 	f.setUpConfigMap(newConfigMap(mpiJob, 1))
+	f.setUpService(newLauncherService(mpiJob))
 	f.setUpRbac(mpiJob, 1)
 
 	fmjc := newFakeMPIJobController()
@@ -859,10 +900,11 @@ func TestWorkerReady(t *testing.T) {
 	startTime := metav1.Now()
 	completionTime := metav1.Now()
 
-	mpiJob := newMPIJob("test", int32Ptr(16), 1, gpuResourceName, &startTime, &completionTime)
+	mpiJob := newMPIJob("experiment", int32Ptr(16), 1, gpuResourceName, &startTime, &completionTime)
 	f.setUpMPIJob(mpiJob)
 
 	f.setUpConfigMap(newConfigMap(mpiJob, 16))
+	f.setUpService(newLauncherService(mpiJob))
 	f.setUpRbac(mpiJob, 16)
 
 	worker := newWorker(mpiJob, 16, "")

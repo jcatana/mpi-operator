@@ -61,24 +61,25 @@ import (
 )
 
 const (
-	controllerAgentName     = "mpi-job-controller"
-	configSuffix            = "-config"
-	configVolumeName        = "mpi-job-config"
-	configMountPath         = "/etc/mpi"
-	kubexecScriptName       = "kubexec.sh"
-	hostfileName            = "hostfile"
-	kubectlDeliveryName     = "kubectl-delivery"
-	kubectlTargetDirEnv     = "TARGET_DIR"
-	kubectlVolumeName       = "mpi-job-kubectl"
-	kubectlMountPath        = "/opt/kube"
-	launcher                = "launcher"
-	worker                  = "worker"
-	launcherSuffix          = "-launcher"
-	workerSuffix            = "-worker"
-	gpuResourceName         = "nvidia.com/gpu"
-	labelGroupName          = "group_name"
-	labelMPIJobName         = "mpi_job_name"
-	labelMPIRoleType        = "mpi_role_type"
+	controllerAgentName = "mpi-job-controller"
+	configSuffix        = "-config"
+	configVolumeName    = "mpi-job-config"
+	configMountPath     = "/etc/mpi"
+	kubexecScriptName   = "kubexec.sh"
+	hostfileName        = "hostfile"
+	kubectlDeliveryName = "kubectl-delivery"
+	kubectlTargetDirEnv = "TARGET_DIR"
+	kubectlVolumeName   = "mpi-job-kubectl"
+	kubectlMountPath    = "/opt/kube"
+	launcher            = "launcher"
+	worker              = "worker"
+	launcherSuffix      = "-launcher"
+	workerSuffix        = "-worker"
+	gpuResourceName     = "nvidia.com/gpu"
+	labelGroupName      = "group_name"
+	labelMPIJobName     = "mpi_job_name"
+	labelMPIRoleType    = "mpi_role_type"
+	fakeServicePort         = 9999
 	initContainerCpu        = "100m"
 	initContainerEphStorage = "5Gi"
 	initContainerMem        = "512Mi"
@@ -133,6 +134,8 @@ type MPIJobController struct {
 
 	configMapLister      corelisters.ConfigMapLister
 	configMapSynced      cache.InformerSynced
+	serviceLister        corelisters.ServiceLister
+	serviceSynced        cache.InformerSynced
 	serviceAccountLister corelisters.ServiceAccountLister
 	serviceAccountSynced cache.InformerSynced
 	roleLister           rbaclisters.RoleLister
@@ -172,6 +175,7 @@ func NewMPIJobController(
 	kubeflowClient clientset.Interface,
 	kubeBatchClientSet kubebatchclient.Interface,
 	configMapInformer coreinformers.ConfigMapInformer,
+	serviceInformer coreinformers.ServiceInformer,
 	serviceAccountInformer coreinformers.ServiceAccountInformer,
 	roleInformer rbacinformers.RoleInformer,
 	roleBindingInformer rbacinformers.RoleBindingInformer,
@@ -202,6 +206,8 @@ func NewMPIJobController(
 		kubebatchClient:      kubeBatchClientSet,
 		configMapLister:      configMapInformer.Lister(),
 		configMapSynced:      configMapInformer.Informer().HasSynced,
+		serviceLister:        serviceInformer.Lister(),
+		serviceSynced:        serviceInformer.Informer().HasSynced,
 		serviceAccountLister: serviceAccountInformer.Lister(),
 		serviceAccountSynced: serviceAccountInformer.Informer().HasSynced,
 		roleLister:           roleInformer.Lister(),
@@ -247,6 +253,21 @@ func NewMPIJobController(
 			if newConfigMap.ResourceVersion == oldConfigMap.ResourceVersion {
 				// Periodic re-sync will send update events for all known
 				// ConfigMaps. Two different versions of the same ConfigMap
+				// will always have different RVs.
+				return
+			}
+			controller.handleObject(new)
+		},
+		DeleteFunc: controller.handleObject,
+	})
+	serviceInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: controller.handleObject,
+		UpdateFunc: func(old, new interface{}) {
+			newService := new.(*corev1.Service)
+			oldService := old.(*corev1.Service)
+			if newService.ResourceVersion == oldService.ResourceVersion {
+				// Periodic re-sync will send update events for all known
+				// Services. Two different versions of the same Service
 				// will always have different RVs.
 				return
 			}
@@ -532,6 +553,11 @@ func (c *MPIJobController) syncHandler(key string) error {
 			return err
 		}
 
+		// Get the Service for this MPIJob.
+		if r, err := c.getOrCreateService(mpiJob); r == nil || err != nil {
+			return err
+		}
+
 		// Get the launcher ServiceAccount for this MPIJob.
 		if sa, err := c.getOrCreateLauncherServiceAccount(mpiJob); sa == nil || err != nil {
 			return err
@@ -677,6 +703,30 @@ func (c *MPIJobController) getOrCreateConfigMap(mpiJob *kubeflow.MPIJob, workerR
 	}
 
 	return cm, nil
+}
+
+// getOrCreateService gets the Service controlled by this MPIJob.
+func (c *MPIJobController) getOrCreateService(mpiJob *kubeflow.MPIJob) (*corev1.Service, error) {
+	service, err := c.serviceLister.Services(mpiJob.Namespace).Get(mpiJob.Name + workerSuffix)
+	// If the Service doesn't exist, we'll create it.
+	if errors.IsNotFound(err) {
+		service, err = c.kubeClient.CoreV1().Services(mpiJob.Namespace).Create(newLauncherService(mpiJob))
+	}
+	// If an error occurs during Get/Create, we'll requeue the item so we
+	// can attempt processing again later. This could have been caused by a
+	// temporary network failure, or any other transient reason.
+	if err != nil {
+		return nil, err
+	}
+	// If the launcher Role is not controlled by this MPIJob resource, we
+	// should log a warning to the event recorder and return.
+	if !metav1.IsControlledBy(service, mpiJob) {
+		msg := fmt.Sprintf(MessageResourceExists, service.Name, service.Kind)
+		c.recorder.Event(mpiJob, corev1.EventTypeWarning, ErrResourceExists, msg)
+		return nil, fmt.Errorf(msg)
+	}
+
+	return service, nil
 }
 
 // getOrCreateLauncherServiceAccount gets the launcher ServiceAccount controlled
@@ -961,7 +1011,7 @@ func newConfigMap(mpiJob *kubeflow.MPIJob, workerReplicas int32) *corev1.ConfigM
 	// This part closely related to specific ssh commands.
 	// It is very likely to fail due to the version change of the MPI framework.
 	// Attempt to automatically filter prefix parameters by detecting "-" matches.
-	// In order to enable IntelMPI and MVAPICH2 to parse pod names, in the Init container, 
+	// In order to enable IntelMPI and MVAPICH2 to parse pod names, in the Init container,
 	// a hosts file containing all workers is generated based on the pods list.
 	// Will use kubectl to send it to the workers and append it to the end of the original hosts file.
 	kubexec := fmt.Sprintf(`#!/bin/sh
@@ -973,12 +1023,11 @@ shift
 POD_NAME=$1
 done
 shift
-%s/kubectl cp %s/hosts ${POD_NAME}:/etc/hosts_of_nodes
-%s/kubectl exec ${POD_NAME}`, kubectlMountPath, kubectlMountPath, kubectlMountPath)
+%s/kubectl exec ${POD_NAME}`, kubectlMountPath)
 	if len(mpiJob.Spec.MainContainer) > 0 {
 		kubexec = fmt.Sprintf("%s --container %s", kubexec, mpiJob.Spec.MainContainer)
 	}
-	kubexec = fmt.Sprintf("%s -- /bin/sh -c \"cat /etc/hosts_of_nodes >> /etc/hosts && $*\"", kubexec)
+	kubexec = fmt.Sprintf("%s -- /bin/sh -c \"$*\"", kubexec)
 
 	// If no processing unit is specified, default to 1 slot.
 	slots := 1
@@ -992,9 +1041,9 @@ shift
 	for i := 0; i < int(workerReplicas); i++ {
 		mpiDistribution := mpiJob.Spec.MPIDistribution
 		if mpiDistribution != nil && (*mpiDistribution == kubeflow.MPIDistributionTypeIntelMPI || *mpiDistribution == kubeflow.MPIDistributionTypeMPICH) {
-			buffer.WriteString(fmt.Sprintf("%s%s-%d:%d\n", mpiJob.Name, workerSuffix, i, slots))
+			buffer.WriteString(fmt.Sprintf("%s%s-%d.%s%s:%d\n", mpiJob.Name, workerSuffix, i, mpiJob.Name, workerSuffix, slots))
 		} else {
-			buffer.WriteString(fmt.Sprintf("%s%s-%d slots=%d\n", mpiJob.Name, workerSuffix, i, slots))
+			buffer.WriteString(fmt.Sprintf("%s%s-%d.%s%s slots=%d\n", mpiJob.Name, workerSuffix, i, mpiJob.Name, workerSuffix, slots))
 		}
 	}
 
@@ -1012,6 +1061,38 @@ shift
 		Data: map[string]string{
 			hostfileName:      buffer.String(),
 			kubexecScriptName: kubexec,
+		},
+	}
+}
+
+// newLauncherService creates a new Service for an MPIJob's stateful set so workers
+// can be resolved by internal kube dns It also
+// sets the appropriate OwnerReferences on the resource so handleObject can
+// discover the MPIJob resource that 'owns' it.
+func newLauncherService(mpiJob *kubeflow.MPIJob) *corev1.Service {
+	return &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      mpiJob.Name + workerSuffix,
+			Namespace: mpiJob.Namespace,
+			Labels: map[string]string{
+				"app": mpiJob.Name,
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(mpiJob, kubeflow.SchemeGroupVersionKind),
+			},
+		},
+		Spec: corev1.ServiceSpec{
+			ClusterIP: "None",
+			Type:      "ClusterIP",
+			Selector: map[string]string{
+				"mpi_job_name": mpiJob.Name,
+			},
+			Ports:[]corev1.ServicePort{
+				{
+					Protocol:   corev1.ProtocolTCP,
+					Port:       fakeServicePort,
+				},
+			},
 		},
 	}
 }
@@ -1157,6 +1238,13 @@ func newWorker(mpiJob *kubeflow.MPIJob, desiredReplicas int32, gangSchedulerName
 	if len(container.Command) == 0 {
 		container.Command = []string{"sleep"}
 		container.Args = []string{"365d"}
+		//here
+		container.Ports = []corev1.ContainerPort{
+			{
+				ContainerPort:       fakeServicePort,
+			},
+		}
+		//tohere
 	}
 
 	// We need the kubexec.sh script here because Open MPI checks for the path
